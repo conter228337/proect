@@ -1,6 +1,14 @@
-FROM mcr.microsoft.com/vscode/devcontainers/base:ubuntu
+FROM python:3.12-slim
 
-USER vscode
-WORKDIR /workspaces
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-CMD ["sleep", "infinity"]
+WORKDIR /workspace
+
+COPY requirements-forecast.txt .
+RUN pip install --no-cache-dir -r requirements-forecast.txt
+
+COPY forecast_credit_risk.py report_sentiment.py test_forecast_credit_risk.py test_report_sentiment.py ./
+
+ENTRYPOINT ["python"]
+CMD ["forecast_credit_risk.py", "--help"]

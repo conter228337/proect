@@ -1,0 +1,23 @@
+services:
+  forecast:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./:/workspace:ro
+      - ./output:/output
+    command:
+      - forecast_credit_risk.py
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./:/workspace:ro
+    command:
+      - -m
+      - unittest
+      - -v
+      - test_report_sentiment
+      - test_forecast_credit_risk
