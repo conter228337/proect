@@ -1,0 +1,28 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Build output
+dist/
+build/
+coverage/
+
+# IDE and local settings
+.vscode/
+.idea/
+.devcontainer/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
