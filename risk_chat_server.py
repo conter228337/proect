@@ -14,6 +14,7 @@ BACKTEST_PATH = ROOT / "credit_risk_backtest_ready.csv"
 MOEX_PATH = ROOT / "training_moex_issuers.csv"
 RFSD_PATH = ROOT / "training_moex_rfsd_financials.csv"
 DISCLOSURE_PATH = ROOT / "training_disclosure_events.jsonl"
+EVENT_DETAILS_PATH = ROOT / "training_event_details.jsonl"
 MODEL_NOTICE = (
     "Оценка экспериментальная и не калибрована; используйте её только для "
     "исследовательских целей, не для кредитных решений."
@@ -167,6 +168,59 @@ class ChatHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/collection/details-next":
+            from urllib.parse import parse_qs
+
+            query = parse_qs(parsed.query)
+            kind = query.get("kind", ["rating"])[0]
+            if kind not in {"rating", "default"}:
+                self._send_json({"error": "kind must be rating or default."}, 400)
+                return
+            limit = min(20, max(1, int(query.get("limit", ["10"])[0])))
+            done = set()
+            if EVENT_DETAILS_PATH.exists():
+                with EVENT_DETAILS_PATH.open(encoding="utf-8") as source:
+                    for line in source:
+                        try:
+                            done.add(json.loads(line)["guid"])
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+            items, seen = [], set()
+            if DISCLOSURE_PATH.exists():
+                with DISCLOSURE_PATH.open(encoding="utf-8") as source:
+                    for line in source:
+                        try:
+                            company = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        for event in company.get("events", []):
+                            name = event.get("eventName", "")
+                            normalized = name.lower()
+                            if kind == "rating":
+                                matches = "рейтинг" in normalized and any(
+                                    word in normalized for word in ("присвоени", "изменени", "кредитный")
+                                )
+                            else:
+                                matches = any(
+                                    word in normalized
+                                    for word in ("дефолт", "неисполнении обязательств", "неисполнение обязательств")
+                                )
+                            guid = event.get("pseudoGUID", "")
+                            if not matches or not guid or guid in done or guid in seen:
+                                continue
+                            seen.add(guid)
+                            items.append({
+                                "inn": company.get("inn", ""),
+                                "guid": guid,
+                                "event_name": name,
+                                "pub_date": event.get("pubDate", ""),
+                                "kind": kind,
+                            })
+                            if len(items) >= limit:
+                                self._send_json({"kind": kind, "items": items, "remaining": None})
+                                return
+            self._send_json({"kind": kind, "items": items, "remaining": len(items)})
+            return
         if parsed.path != "/api/collection/next":
             super().do_GET()
             return
@@ -193,6 +247,39 @@ class ChatHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/collection/save-details":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 5_000_000:
+                    raise ValueError("Detail batch is empty or too large.")
+                payload = json.loads(self.rfile.read(length))
+                records = payload.get("records")
+                if not isinstance(records, list) or len(records) > 25:
+                    raise ValueError("A detail batch may contain at most 25 records.")
+                existing = set()
+                if EVENT_DETAILS_PATH.exists():
+                    with EVENT_DETAILS_PATH.open(encoding="utf-8") as source:
+                        for line in source:
+                            try:
+                                existing.add(json.loads(line)["guid"])
+                            except (json.JSONDecodeError, KeyError):
+                                continue
+                saved = 0
+                with EVENT_DETAILS_PATH.open("a", encoding="utf-8") as output:
+                    for record in records:
+                        guid = str(record.get("guid", ""))
+                        text = record.get("text", "")
+                        if not guid or not isinstance(text, str):
+                            raise ValueError("Each detail must include guid and text.")
+                        if guid in existing:
+                            continue
+                        output.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        existing.add(guid)
+                        saved += 1
+                self._send_json({"saved": saved})
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, 400)
+            return
         if path == "/api/collection/save":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
