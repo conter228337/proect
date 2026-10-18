@@ -1,0 +1,4 @@
+/.venv/
+/project_all_files.zip
+__pycache__/
+*.py[cod]

@@ -9,6 +9,21 @@ services:
     command:
       - forecast_credit_risk.py
 
+  gui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+      - XAUTHORITY=/tmp/.Xauthority
+    volumes:
+      - ./:/workspace:rw
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${HOME}/.Xauthority:/tmp/.Xauthority:rw
+    command:
+      - model_gui_advanced.py
+
   test:
     build:
       context: .

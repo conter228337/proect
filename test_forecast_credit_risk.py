@@ -1,14 +1,17 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
 from forecast_credit_risk import (
     FEATURES,
+    backtest_forecasts,
     _next_year_pairs,
     _prepare_panel,
     _training_pairs_as_of,
     generate_forecasts,
+    validate_training_data,
 )
 
 
@@ -59,6 +62,31 @@ class ForecastCreditRiskTests(unittest.TestCase):
         _, available_targets = _training_pairs_as_of(features, targets, 2021)
         self.assertEqual(available_targets["target_year"].tolist(), [2021])
 
+    def test_backtest_returns_one_year_ahead_predictions_and_actual_labels(self):
+        panel = pd.DataFrame(
+            {
+                "inn": ["1234567890"] * 3,
+                "year": [2020, 2021, 2022],
+                "default": [0, 1, 0],
+                "rating": ["AA", "A", "BBB"],
+                "sentiment_score": [0.2, -0.1, 0.3],
+            }
+        )
+
+        with patch("forecast_credit_risk._fit_models") as fit_models:
+            fit_models.return_value = (None, "test", [], None, "test", [])
+            result = backtest_forecasts(panel)
+
+        self.assertEqual(result["feature_year"].tolist(), [2020, 2021])
+        self.assertEqual(result["forecast_year"].tolist(), [2021, 2022])
+        self.assertEqual(result["actual_default"].tolist(), [1, 0])
+        self.assertTrue(result["actual_rating_score"].notna().all())
+        training_target_years = [
+            call.args[1]["target_year"].tolist()
+            for call in fit_models.call_args_list
+        ]
+        self.assertEqual(training_target_years, [[], [2021]])
+
     def test_insufficient_labels_produce_status_instead_of_fake_prediction(self):
         panel = pd.DataFrame(
             {
@@ -82,6 +110,23 @@ class ForecastCreditRiskTests(unittest.TestCase):
             "недостаточно данных", forecast.loc[0, "rating_model_status"]
         )
         self.assertEqual(forecast.loc[0, "forecast_year"], 2025)
+
+    def test_validate_training_data_reports_threshold_issues(self):
+        panel = pd.DataFrame(
+            {
+                "ИНН": ["0012345678", "0012345678"],
+                "Год": [2023, 2024],
+                "дефолт (по облигациям)": [0, 0],
+                "рейтинг": ["AA", "A"],
+                "Тональность отчёта (RuBERT, positive - negative)": [0.2, -0.1],
+            }
+        )
+        report = validate_training_data(panel)
+        self.assertFalse(report["overall_ready"])
+        self.assertFalse(report["default"]["ready"])
+        self.assertFalse(report["rating"]["ready"])
+        self.assertIn("нужно минимум 30", report["default"]["reason"])
+        self.assertIn("нужно минимум 30", report["rating"]["reason"])
 
     def test_missing_feature_columns_are_created_as_nan(self):
         panel = _prepare_panel(pd.DataFrame({"inn": ["1234567890"], "year": [2024]}))

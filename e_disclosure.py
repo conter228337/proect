@@ -3,8 +3,18 @@ import csv
 import json
 import os
 import re
+import sys
 import time
+import webbrowser
 from datetime import date, timedelta
+
+try:
+    import tkinter as tk
+    from tkinter import messagebox
+except Exception:  # pragma: no cover - GUI может отсутствовать в headless-средах
+    tk = None
+    messagebox = None
+
 from playwright.sync_api import sync_playwright
 from logutil import log as print   # print с префиксом [ИНН ...] текущей компании
 
@@ -282,6 +292,35 @@ class EDisclosure:
     def _is_json(out):
         return out is not None and "json" in out["ctype"]
 
+    @staticmethod
+    def _wait_for_manual_captcha(reason: str, url: str = SEARCH_PAGE) -> None:
+        print("\n===== Требуется ручная капча / подтверждение e-disclosure =====")
+        print(reason)
+        print(f"URL для решения: {url}")
+        try:
+            webbrowser.open(url, new=2, autoraise=True)
+        except Exception:
+            pass
+
+        if tk is not None and messagebox is not None:
+            try:
+                root = tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                messagebox.showinfo(
+                    "Ручная капча e-disclosure",
+                    f"{reason}\n\nОткройте страницу и решите CAPTCHA, затем нажмите OK.\n\nURL: {url}",
+                )
+                root.update()
+                root.destroy()
+                return
+            except Exception:
+                pass
+
+        print("Пожалуйста, пройдите капчу в открывшемся окне браузера и затем нажмите Enter в этом терминале.")
+        sys.stdout.flush()
+        input("Нажмите Enter после прохождения капчи: ")
+
     def _pass_captcha(self):
         try:
             self.search_page.goto(SEARCH_PAGE)
@@ -294,7 +333,10 @@ class EDisclosure:
             if self._is_json(self._raw_fetch(probe)):
                 print("Доступ к сайту есть.")
                 return
-            input("Пройдите капчу в окне браузера, дождитесь страницы поиска и нажмите Enter...")
+            self._wait_for_manual_captcha(
+                "Запрос к e-disclosure заблокирован CAPTCHA. Откройте страницу поиска и решите её вручную.",
+                SEARCH_PAGE,
+            )
 
     def _open_checked(self, page, url, ok_url_part):
         try:
@@ -306,7 +348,10 @@ class EDisclosure:
             time.sleep(2)
             if "spinner-container" not in page.content() and ok_url_part in page.url:
                 return page
-            input("Пройдите капчу в окне браузера и нажмите Enter...")
+            self._wait_for_manual_captcha(
+                "Открытая страница e-disclosure требует ручного подтверждения CAPTCHA.",
+                url,
+            )
 
     def get_events(self, inn, d1, d2, page_size=100, pause=1.5):
         events, page_no, total_pages, attempts = [], 1, 1, 0

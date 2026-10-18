@@ -195,8 +195,60 @@ def _training_pairs_as_of(
     return features.loc[available], targets.loc[available]
 
 
-def generate_forecasts(frame: pd.DataFrame) -> pd.DataFrame:
-    """Обучить модели на доступных парах и вернуть прогноз для последнего года каждой фирмы."""
+def validate_training_data(frame: pd.DataFrame) -> dict:
+    """Проверить, хватает ли данных для обучения модели дефолта и рейтинга."""
+    panel = _prepare_panel(frame)
+    if panel.empty:
+        raise ValueError("Во входном CSV нет строк с корректными ИНН и годом")
+
+    _, pair_targets = _next_year_pairs(panel)
+    default_values = pair_targets["default"].dropna()
+    default_counts = default_values.value_counts().astype(int)
+    default_ready = (
+        len(default_values) >= 30
+        and default_counts.get(0, 0) >= 10
+        and default_counts.get(1, 0) >= 5
+    )
+
+    rating_values = pair_targets["rating_score"].dropna()
+    rating_ready = len(rating_values) >= 30 and rating_values.nunique() >= 3
+
+    default_reason = "" if default_ready else (
+        f"недостаточно данных (строк={len(default_values)}, "
+        f"дефолтов={default_counts.get(1, 0)}, без дефолта={default_counts.get(0, 0)}; "
+        "нужно минимум 30, 5 и 10 соответственно)"
+    )
+    rating_reason = "" if rating_ready else (
+        f"недостаточно данных (строк={len(rating_values)}, "
+        f"различных рейтингов={rating_values.nunique()}; нужно минимум 30 и 3)"
+    )
+
+    return {
+        "companies": int(panel["inn"].nunique()),
+        "panel_rows": int(len(panel)),
+        "training_pairs": int(len(pair_targets)),
+        "default": {
+            "rows": int(len(default_values)),
+            "defaults": int(default_counts.get(1, 0)),
+            "non_defaults": int(default_counts.get(0, 0)),
+            "ready": bool(default_ready),
+            "reason": default_reason,
+        },
+        "rating": {
+            "rows": int(len(rating_values)),
+            "unique_ratings": int(rating_values.nunique()),
+            "ready": bool(rating_ready),
+            "reason": rating_reason,
+        },
+        "overall_ready": bool(default_ready and rating_ready),
+    }
+
+
+def _fit_models(
+    train_features: pd.DataFrame,
+    train_targets: pd.DataFrame,
+):
+    """Обучить модели дефолта и рейтинга на уже доступной истории."""
     try:
         from sklearn.ensemble import RandomForestRegressor
         from sklearn.impute import SimpleImputer
@@ -209,6 +261,109 @@ def generate_forecasts(frame: pd.DataFrame) -> pd.DataFrame:
             "pip install scikit-learn"
         ) from exc
 
+    default_rows = train_targets["default"].notna()
+    X_default = train_features.loc[default_rows]
+    y_default = train_targets.loc[default_rows, "default"].astype(int)
+    default_features = X_default.columns[X_default.notna().any()].tolist()
+    X_default = X_default.loc[:, default_features]
+    default_model = None
+    default_reason = ""
+    counts = y_default.value_counts()
+    if len(y_default) < 30 or counts.get(0, 0) < 10 or counts.get(1, 0) < 5:
+        default_reason = (
+            f"недостаточно данных (строк={len(y_default)}, "
+            f"дефолтов={counts.get(1, 0)}, без дефолта={counts.get(0, 0)}; "
+            "нужно минимум 30, 5 и 10 соответственно)"
+        )
+    elif not default_features:
+        default_reason = "нет числовых признаков для обучения модели дефолта"
+    else:
+        default_model = make_pipeline(
+            SimpleImputer(strategy="median", add_indicator=True),
+            StandardScaler(),
+            LogisticRegression(max_iter=2_000, random_state=42),
+        )
+        default_model.fit(X_default, y_default)
+
+    rating_rows = train_targets["rating_score"].notna()
+    X_rating = train_features.loc[rating_rows]
+    y_rating = train_targets.loc[rating_rows, "rating_score"].astype(float)
+    rating_features = X_rating.columns[X_rating.notna().any()].tolist()
+    X_rating = X_rating.loc[:, rating_features]
+    rating_model = None
+    rating_reason = ""
+    if len(y_rating) < 30 or y_rating.nunique() < 3:
+        rating_reason = (
+            f"недостаточно данных (строк={len(y_rating)}, "
+            f"различных рейтингов={y_rating.nunique()}; нужно минимум 30 и 3)"
+        )
+    elif not rating_features:
+        rating_reason = "нет числовых признаков для обучения модели рейтинга"
+    else:
+        rating_model = make_pipeline(
+            SimpleImputer(strategy="median", add_indicator=True),
+            RandomForestRegressor(
+                n_estimators=300,
+                min_samples_leaf=2,
+                random_state=42,
+                n_jobs=-1,
+            ),
+        )
+        rating_model.fit(X_rating, y_rating)
+    return (
+        default_model,
+        default_reason,
+        default_features,
+        rating_model,
+        rating_reason,
+        rating_features,
+    )
+
+
+def _predict_row(
+    features: pd.DataFrame,
+    models,
+    *,
+    inn: str,
+    feature_year: int,
+    target_year: int,
+) -> dict:
+    (
+        default_model,
+        default_reason,
+        default_features,
+        rating_model,
+        rating_reason,
+        rating_features,
+    ) = models
+    result = {
+        "inn": inn,
+        "feature_year": feature_year,
+        "forecast_year": target_year,
+        "estimated_default_probability": np.nan,
+        "default_model_status": default_reason or "ok",
+        "predicted_rating": "",
+        "predicted_rating_score": np.nan,
+        "rating_model_status": rating_reason or "ok",
+    }
+    if default_model is not None:
+        positive_index = list(default_model[-1].classes_).index(1)
+        result["estimated_default_probability"] = float(
+            default_model.predict_proba(features.loc[:, default_features])[0][
+                positive_index
+            ]
+        )
+    if rating_model is not None:
+        rating_score = float(
+            rating_model.predict(features.loc[:, rating_features])[0]
+        )
+        result["predicted_rating"] = _nearest_rating(rating_score)
+        result["predicted_rating_score"] = rating_score
+    return result
+
+
+def generate_forecasts(frame: pd.DataFrame) -> pd.DataFrame:
+    """Обучить модели на доступных парах и вернуть прогноз для последнего года каждой фирмы."""
     panel = _prepare_panel(frame)
     if panel.empty:
         raise ValueError("Во входном CSV нет строк с корректными ИНН и годом")
@@ -216,112 +371,62 @@ def generate_forecasts(frame: pd.DataFrame) -> pd.DataFrame:
     pair_features, pair_targets = _next_year_pairs(panel)
     predictions = []
 
-    def fit_models(as_of_year):
-        train_features, train_targets = _training_pairs_as_of(
-            pair_features, pair_targets, as_of_year
-        )
-        default_rows = train_targets["default"].notna()
-        X_default = train_features.loc[default_rows]
-        y_default = train_targets.loc[default_rows, "default"].astype(int)
-        default_features = X_default.columns[X_default.notna().any()].tolist()
-        X_default = X_default.loc[:, default_features]
-        default_model = None
-        default_reason = ""
-        counts = y_default.value_counts()
-        if len(y_default) < 30 or counts.get(0, 0) < 10 or counts.get(1, 0) < 5:
-            default_reason = (
-                f"недостаточно данных (строк={len(y_default)}, "
-                f"дефолтов={counts.get(1, 0)}, без дефолта={counts.get(0, 0)}; "
-                "нужно минимум 30, 5 и 10 соответственно)"
-            )
-        elif not default_features:
-            default_reason = "нет числовых признаков для обучения модели дефолта"
-        else:
-            default_model = make_pipeline(
-                SimpleImputer(strategy="median", add_indicator=True),
-                StandardScaler(),
-                LogisticRegression(max_iter=2_000, random_state=42),
-            )
-            default_model.fit(X_default, y_default)
-
-        rating_rows = train_targets["rating_score"].notna()
-        X_rating = train_features.loc[rating_rows]
-        y_rating = train_targets.loc[rating_rows, "rating_score"].astype(float)
-        rating_features = X_rating.columns[X_rating.notna().any()].tolist()
-        X_rating = X_rating.loc[:, rating_features]
-        rating_model = None
-        rating_reason = ""
-        if len(y_rating) < 30 or y_rating.nunique() < 3:
-            rating_reason = (
-                f"недостаточно данных (строк={len(y_rating)}, "
-                f"различных рейтингов={y_rating.nunique()}; нужно минимум 30 и 3)"
-            )
-        elif not rating_features:
-            rating_reason = "нет числовых признаков для обучения модели рейтинга"
-        else:
-            rating_model = make_pipeline(
-                SimpleImputer(strategy="median", add_indicator=True),
-                RandomForestRegressor(
-                    n_estimators=300,
-                    min_samples_leaf=2,
-                    random_state=42,
-                    n_jobs=-1,
-                ),
-            )
-            rating_model.fit(X_rating, y_rating)
-        return (
-            default_model,
-            default_reason,
-            default_features,
-            rating_model,
-            rating_reason,
-            rating_features,
-        )
-
     models_by_year = {}
     for _, row in latest.iterrows():
         as_of_year = int(row["year"])
         if as_of_year not in models_by_year:
-            models_by_year[as_of_year] = fit_models(as_of_year)
-        (
-            default_model,
-            default_reason,
-            default_features,
-            rating_model,
-            rating_reason,
-            rating_features,
-        ) = models_by_year[as_of_year]
+            train_features, train_targets = _training_pairs_as_of(
+                pair_features, pair_targets, as_of_year
+            )
+            models_by_year[as_of_year] = _fit_models(
+                train_features, train_targets
+            )
         X_current = pd.DataFrame(
             [{name: row.get(name, np.nan) for name in FEATURES}],
             columns=FEATURES,
         )
-        result = {
-            "inn": row["inn"],
-            "ticker": row.get("ticker", ""),
-            "company_name": row.get("company_name", ""),
-            "feature_year": int(row["year"]),
-            "forecast_year": int(row["forecast_year"]),
-            "estimated_default_probability": np.nan,
-            "default_model_status": default_reason or "ok",
-            "predicted_rating": "",
-            "rating_model_status": rating_reason or "ok",
-        }
-        if default_model is not None:
-            classes = list(default_model[-1].classes_)
-            positive_index = classes.index(1)
-            result["estimated_default_probability"] = float(
-                default_model.predict_proba(X_current.loc[:, default_features])[0][
-                    positive_index
-                ]
+        result = _predict_row(
+            X_current,
+            models_by_year[as_of_year],
+            inn=str(row["inn"]),
+            feature_year=as_of_year,
+            target_year=int(row["forecast_year"]),
+        )
+        result["ticker"] = row.get("ticker", "")
+        result["company_name"] = row.get("company_name", "")
+        predictions.append(result)
+    return pd.DataFrame(predictions)
+
+
+def backtest_forecasts(frame: pd.DataFrame) -> pd.DataFrame:
+    """Вернуть one-year-ahead прогнозы для исторических пар без утечки меток."""
+    panel = _prepare_panel(frame)
+    if panel.empty:
+        raise ValueError("Во входном CSV нет строк с корректными ИНН и годом")
+    pair_features, pair_targets = _next_year_pairs(panel)
+    predictions = []
+    models_by_year = {}
+    for index, target in pair_targets.iterrows():
+        as_of_year = int(target["feature_year"])
+        if as_of_year not in models_by_year:
+            train_features, train_targets = _training_pairs_as_of(
+                pair_features, pair_targets, as_of_year
             )
-        if rating_model is not None:
-            rating_score = float(
-                rating_model.predict(X_current.loc[:, rating_features])[0]
+            models_by_year[as_of_year] = _fit_models(
+                train_features, train_targets
             )
-            result["predicted_rating"] = _nearest_rating(rating_score)
-            result["predicted_rating_score"] = rating_score
-        else:
-            result["predicted_rating_score"] = np.nan
+        feature_row = pd.DataFrame(
+            [pair_features.loc[index].to_dict()], columns=FEATURES
+        )
+        result = _predict_row(
+            feature_row,
+            models_by_year[as_of_year],
+            inn=str(target["inn"]),
+            feature_year=as_of_year,
+            target_year=int(target["target_year"]),
+        )
+        result["actual_default"] = target["default"]
+        result["actual_rating_score"] = target["rating_score"]
         predictions.append(result)
     return pd.DataFrame(predictions)
 
@@ -331,6 +436,16 @@ def main() -> None:
     parser.add_argument("input_csv", type=Path, help="CSV, созданный main.py")
     parser.add_argument(
         "-o", "--output", type=Path, help="Файл прогноза (по умолчанию рядом с исходным)"
+    )
+    parser.add_argument(
+        "--backtest-output",
+        type=Path,
+        help="Дополнительно сохранить исторические прогнозы и фактические метки",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Проверить, хватает ли данных для обучения, без создания прогноза",
     )
     args = parser.parse_args()
     if not args.input_csv.is_file():
@@ -343,10 +458,46 @@ def main() -> None:
         encoding="utf-8-sig",
         dtype={"ИНН": "string"},
     )
+    if args.validate_only:
+        report = validate_training_data(panel)
+        print(f"Компаний: {report['companies']}")
+        print(f"Строк в панели: {report['panel_rows']}")
+        print(f"Пары для обучения: {report['training_pairs']}")
+        print(
+            "Default ready: "
+            f"{report['default']['ready']} | "
+            f"rows={report['default']['rows']}, defaults={report['default']['defaults']}, "
+            f"non_defaults={report['default']['non_defaults']}"
+        )
+        print(
+            "Rating ready: "
+            f"{report['rating']['ready']} | "
+            f"rows={report['rating']['rows']}, unique={report['rating']['unique_ratings']}"
+        )
+        print(f"Overall ready: {report['overall_ready']}")
+        if report["default"]["reason"]:
+            print("Default: " + report["default"]["reason"])
+        if report["rating"]["reason"]:
+            print("Rating: " + report["rating"]["reason"])
+        return
+
     forecast = generate_forecasts(panel)
     output = args.output or args.input_csv.with_name("credit_risk_forecasts.csv")
     forecast.to_csv(output, index=False, sep=";", decimal=",", encoding="utf-8-sig")
     print(f"Сохранено прогнозов: {len(forecast)} -> {output}")
+    if args.backtest_output:
+        backtest = backtest_forecasts(panel)
+        backtest.to_csv(
+            args.backtest_output,
+            index=False,
+            sep=";",
+            decimal=",",
+            encoding="utf-8-sig",
+        )
+        print(
+            f"Сохранено исторических прогнозов: {len(backtest)} "
+            f"-> {args.backtest_output}"
+        )
     if not forecast.empty:
         unavailable = forecast[
             forecast["default_model_status"].ne("ok")
